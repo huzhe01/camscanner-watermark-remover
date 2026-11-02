@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="在浏览器本地移除扫描全能王 PDF 页脚水印。支持批量，保持正文清晰度，文件不上传。" />
+    <meta name="referrer" content="no-referrer" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; worker-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'" />
+    <meta name="theme-color" content="#f6f5f0" />
+    <title>PDF 清印 · 本地去水印工具</title>
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="site-header">
+        <a class="brand" href="./" aria-label="PDF 清印 首页">
+          <svg class="brand-icon" viewBox="0 0 36 36" fill="none" aria-hidden="true"><path d="M9 3h12l7 7v22H9z" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/><path d="M21 3v8h7M14 18h9M14 23h7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><path d="m28 21 1.6 4.4L34 27l-4.4 1.6L28 33l-1.6-4.4L22 27l4.4-1.6z" fill="#3155e7" stroke="#f6f5f0" stroke-width="1.5"/></svg>
+          <span>PDF 清印<span class="brand-caption">A LITTLE PDF UTILITY</span></span>
+        </a>
+        <span class="local-badge"><span></span>在你的设备上完成</span>
+      </header>
+
+      <main>
+        <section class="intro" aria-labelledby="page-title">
+          <p class="eyebrow"><span></span>给文档，留一点干净的边角</p>
+          <h1 id="page-title">去掉页脚水印，<br />保留每一页的<span class="title-emphasis">清晰。</span></h1>
+          <p class="intro-text">移除扫描全能王导出时添加的右下角标记。<br class="desktop-break" />不用安装，不用登录，文件始终留在你的浏览器里。</p>
+        </section>
+
+        <div class="workspace">
+          <section class="tool-panel" aria-label="PDF 去水印">
+            <div class="panel-heading"><h2>选择你的 PDF</h2><span class="step-tag">01 — 02 — 03</span></div>
+            <input id="file-input" type="file" accept="application/pdf,.pdf" multiple />
+            <div class="drop-zone" id="drop-zone" role="button" tabindex="0" aria-label="选择或拖入 PDF 文件">
+              <div class="file-illustration" aria-hidden="true"><span class="back-sheet"></span><span class="front-sheet"><span class="pdf-label">PDF</span><i></i><i></i><i></i><span class="tiny-spark">✦</span></span></div>
+              <h3>把 PDF 拖到这里</h3>
+              <p>或点击选择文件 · 支持批量处理</p>
+              <span class="choose-button">选择 PDF <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+              <p class="file-limit">单个文件最大 100 MB</p>
+            </div>
+
+            <div id="queue" class="queue" hidden>
+              <div class="queue-heading"><span id="queue-count"></span><button class="text-button" id="clear-button" type="button">清空列表</button></div>
+              <ul id="file-list" class="file-list" aria-label="已选择的文件"></ul>
+              <button id="process-button" class="primary-button" type="button"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m11 2-7 9h5l-1 7 8-10h-5l0-6Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg><span>去除水印</span></button>
+            </div>
+            <p id="status" class="status" role="status" aria-live="polite"></p>
+            <p class="privacy-note"><svg viewBox="0 0 18 18" fill="none" aria-hidden="true"><path d="m9 2 5 2v5c0 3-5 6-5 6S4 12 4 9V4l5-2Z" stroke="currentColor" stroke-width="1.3"/><path d="m6.7 8.6 1.5 1.5 3-3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>文件不上传 · 不覆盖原件 · 不重新压缩正文</p>
+          </section>
+
+          <aside class="side-panel" aria-labelledby="how-it-looks">
+            <div class="preview-heading"><span class="eyebrow">一个小小的改变</span><h2 id="how-it-looks">文档还是那份文档。</h2></div>
+            <div class="comparison-demo" id="demo-preview" aria-label="页脚去水印示意图">
+              <div class="sample-document"><div class="sample-lines"><i></i><i></i><i></i><i></i><i></i></div><div class="sample-bottom"><span class="sample-page-number">— 01 —</span><span class="sample-mark">扫描工具标记</span></div></div>
+              <div class="comparison-arrow" aria-hidden="true">↓</div>
+              <div class="sample-document clean-document"><div class="sample-lines"><i></i><i></i><i></i><i></i><i></i></div><div class="sample-bottom"><span class="sample-page-number">— 01 —</span><span class="clean-check">✓</span></div></div>
+              <p class="demo-caption">效果示意 · 仅移除支持的页脚标记</p>
+            </div>
+            <div class="real-preview" id="real-preview" hidden>
+              <p class="preview-description">第一页右下角 · 你的文件</p>
+              <div class="canvas-preview"><span>处理前</span><canvas id="before-canvas" aria-label="处理前的页脚预览"></canvas></div>
+              <div class="canvas-preview"><span>处理后</span><canvas id="after-canvas" aria-label="处理后的页脚预览"></canvas></div>
+              <p id="preview-status" class="demo-caption" role="status"></p>
+            </div>
+            <div class="feature-list"><p><span>01</span>选择一个或多个 PDF</p><p><span>02</span>点击去除水印</p><p><span>03</span>下载干净的新副本</p></div>
+          </aside>
+        </div>
+
+        <section id="results" class="results" hidden aria-labelledby="results-title">
+          <div class="results-heading"><div><p class="eyebrow">处理完成</p><h2 id="results-title">你的文件，已准备好。</h2></div><button id="download-all" class="secondary-button" type="button">逐个下载全部</button></div>
+          <ul id="result-list" class="result-list"></ul>
+          <p class="downloads-note">浏览器可能会询问是否允许下载多个文件；也可以分别点击下载。</p>
+        </section>
+
+        <section class="faq" aria-labelledby="faq-title">
+          <div class="faq-intro"><p class="eyebrow">使用之前</p><h2 id="faq-title">你可能想知道</h2></div>
+          <div class="faq-items">
+            <details><summary>哪些水印可以去掉？<span>+</span></summary><p>目前支持已核验的扫描全能王“二维码 + CS 扫描全能王”右下角页脚标记，且标记需要与正文分开保存。不同版本、融入扫描图片或压在正文上的水印会跳过，并给出提示。</p></details>
+            <details><summary>正文会变模糊吗？<span>+</span></summary><p>工具直接删除匹配的页脚标记，不把整页转成图片，也不重新压缩正文。页面大小和原有文字层会保留；如文件结构不受支持，会停止或跳过。</p></details>
+            <details><summary>文件会上传或留存吗？<span>+</span></summary><p>不会上传。选择的 PDF 只在当前浏览器内存中处理，没有文件上传接口，也不使用统计追踪。关闭或刷新页面后，需要重新选择文件。网站本身公开可访问，你的文件不会因此公开。</p></details>
+            <details><summary>手机上能用吗？<span>+</span></summary><p>可以使用支持现代网页功能的手机浏览器。大文件会占用较多内存，建议在电脑上处理。结果通过浏览器下载，请到浏览器的下载列表或设备的“文件”中查看。</p></details>
+          </div>
+        </section>
+      </main>
+      <footer><span>PDF 清印 <span class="footer-dot">·</span> 简单处理，清晰如初。</span><span>独立小工具，与扫描全能王无隶属关系。</span></footer>
+    </div>
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.DS_Store
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.zip
+.env*
+playwright-output/
+.playwright-cli/
+output/
+tmp/
