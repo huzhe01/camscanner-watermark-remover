@@ -137,6 +137,37 @@ function download(output) {
   link.remove();
 }
 
+function getPageNumber(page, fallbackIndex = 0) {
+  if (Number.isInteger(page.pageNumber) && page.pageNumber > 0) return page.pageNumber;
+  return Number.isInteger(page.index) && page.index >= 0 ? page.index + 1 : fallbackIndex + 1;
+}
+
+function formatPageNumbers(numbers) {
+  const sorted = [...new Set(numbers)].sort((a, b) => a - b);
+  const ranges = [];
+  for (let i = 0; i < sorted.length; i += 1) {
+    const start = sorted[i];
+    let end = start;
+    while (i + 1 < sorted.length && sorted[i + 1] === end + 1) end = sorted[++i];
+    ranges.push(start === end ? String(start) : `${start}–${end}`);
+  }
+  return ranges.join('、');
+}
+
+function groupPageReasons(result) {
+  const groups = new Map();
+  if (!Array.isArray(result.pages)) return [];
+  result.pages.forEach((page, index) => {
+    const reason = typeof page.reason === 'string' && page.reason.trim()
+      ? page.reason.trim()
+      : page.status === 'skipped' ? '本页未找到可以确认的独立页脚标记，未作修改。' : '';
+    if (!reason) return;
+    if (!groups.has(reason)) groups.set(reason, []);
+    groups.get(reason).push(getPageNumber(page, index));
+  });
+  return [...groups].map(([reason, pages]) => ({ reason, pages }));
+}
+
 function renderResult(output) {
   const item = createElement('li', 'result-item');
   const state = createElement('span', `result-state ${output.status}`, output.status === 'cleaned' ? '✓' : output.status === 'skipped' ? '—' : '!');
@@ -145,6 +176,17 @@ function renderResult(output) {
   const name = createElement('p', 'file-name', output.originalName);
   name.title = output.originalName;
   info.append(name, createElement('p', 'result-note', output.message));
+  if (output.diagnostics?.length) {
+    const details = createElement('details', 'result-diagnostics result-note');
+    const summary = createElement('summary', 'text-button', output.status === 'cleaned'
+      ? `查看其余 ${output.unchangedPages} 页未修改的原因`
+      : '查看逐页原因');
+    details.append(summary);
+    for (const group of output.diagnostics) {
+      details.append(createElement('p', 'result-note', `第 ${formatPageNumbers(group.pages)} 页：${group.reason}`));
+    }
+    info.append(details);
+  }
   item.append(state, info);
   if (output.url) {
     const button = createElement('button', 'download-button', '下载 PDF ↓');
@@ -166,7 +208,7 @@ async function getPdfJs() {
   return pdfJsPromise;
 }
 
-async function drawFooter(bytes, canvas, generation) {
+async function drawFooter(bytes, canvas, generation, pageNumber) {
   const pdfjs = await getPdfJs();
   if (generation !== previewGeneration) return;
   const task = pdfjs.getDocument({
@@ -178,7 +220,7 @@ async function drawFooter(bytes, canvas, generation) {
   let pdf;
   try {
     pdf = await task.promise;
-    const page = await pdf.getPage(1);
+    const page = await pdf.getPage(pageNumber);
     const scale = 1.5;
     const viewport = page.getViewport({ scale });
     const temporary = document.createElement('canvas');
@@ -197,16 +239,17 @@ async function drawFooter(bytes, canvas, generation) {
   }
 }
 
-async function preview(file, bytes) {
+async function preview(file, bytes, pageNumber) {
   const generation = ++previewGeneration;
   $('demo-preview').hidden = true;
   $('real-preview').hidden = false;
+  $('preview-description').textContent = `第 ${pageNumber} 页右下角 · 你的文件`;
   $('preview-status').textContent = '正在生成本地预览…';
   try {
     const before = await file.arrayBuffer();
     await Promise.all([
-      drawFooter(before, $('before-canvas'), generation),
-      drawFooter(bytes, $('after-canvas'), generation),
+      drawFooter(before, $('before-canvas'), generation, pageNumber),
+      drawFooter(bytes, $('after-canvas'), generation, pageNumber),
     ]);
     if (generation === previewGeneration) $('preview-status').textContent = '预览仅在本机生成 · 请检查下载后的完整文件';
   } catch (error) {
@@ -233,18 +276,32 @@ processButton.onclick = async () => {
     try {
       const buffer = await file.arrayBuffer();
       const result = await processPdf(buffer);
+      const diagnostics = groupPageReasons(result);
       if (result.status === 'cleaned' && result.bytes) {
         const blob = new Blob([result.bytes], { type: 'application/pdf' });
+        const unchangedPages = Math.max(0, result.pageCount - result.changedPages);
         output = {
           status: 'cleaned',
           originalName: file.name,
           filename: file.name.replace(/\.pdf$/i, '') + '_去水印.pdf',
           url: URL.createObjectURL(blob),
-          message: `已去除 ${result.removedWatermarks} 处水印 · ${result.changedPages} / ${result.pageCount} 页已处理`,
+          unchangedPages,
+          diagnostics: unchangedPages ? diagnostics : [],
+          message: `已去除 ${result.removedWatermarks} 处水印 · ${result.changedPages} / ${result.pageCount} 页已处理${unchangedPages ? ` · 其余 ${unchangedPages} 页未修改` : ''}`,
         };
-        if (!previewWork) previewWork = preview(file, result.bytes);
+        if (!previewWork) {
+          const changedPage = Array.isArray(result.pages)
+            ? result.pages.find((page) => page.status === 'cleaned')
+            : null;
+          previewWork = preview(file, result.bytes, changedPage ? getPageNumber(changedPage) : 1);
+        }
       } else {
-        output = { status: 'skipped', originalName: file.name, message: result.reason || '未找到支持的页脚水印，原文件未修改。' };
+        output = {
+          status: 'skipped',
+          originalName: file.name,
+          message: result.reason || '未找到可以确认的独立页脚水印，原文件未修改。',
+          diagnostics,
+        };
       }
     } catch (error) {
       output = { status: 'error', originalName: file.name, message: error?.message || '无法处理此文件，请检查文件是否完整。' };
@@ -255,10 +312,11 @@ processButton.onclick = async () => {
   busy = false;
   renderQueue();
   const cleaned = outputs.filter((output) => output.status === 'cleaned').length;
+  const partial = outputs.filter((output) => output.status === 'cleaned' && output.unchangedPages > 0).length;
   const skipped = outputs.filter((output) => output.status === 'skipped').length;
   const failed = outputs.length - cleaned - skipped;
   $('download-all').hidden = cleaned < 2;
-  setStatus(`完成：${cleaned} 个文件已处理${skipped ? `，${skipped} 个已跳过` : ''}${failed ? `，${failed} 个未能处理` : ''}。`);
+  setStatus(`完成：${cleaned} 个文件已处理${partial ? `（其中 ${partial} 个仅处理部分页面）` : ''}${skipped ? `，${skipped} 个已跳过` : ''}${failed ? `，${failed} 个未能处理` : ''}。`);
   if (previewWork) await previewWork;
 };
 

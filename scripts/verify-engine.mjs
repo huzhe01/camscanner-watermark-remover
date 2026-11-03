@@ -58,6 +58,96 @@ async function fixture({ logo, pages = ['q 104 0 0 30 476 10 cm /Mark Do Q'], sh
   return doc.save({ useObjectStreams: false, updateFieldAppearances: false });
 }
 
+const tinyJpeg = Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0dHx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4ICA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh7/wAARCAABAAMDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAj/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFAEBAAAAAAAAAAAAAAAAAAAABP/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/AKAALFf/2Q==', 'base64');
+
+// Entirely synthetic scans let CI exercise structural detection without any
+// personal PDF or copied brand image in the repository.
+async function structuralFixture(options = {}) {
+  const { encoding = 'FlateDecode', pixels = [240, 90], media = [0, 0, 595, 842],
+    resourceName = 'A_Renamed_Image', body = true, bodyForm = false, extraForm = false,
+    footer, bodyTransform, prefix = '', annotationSpecs, linksByPage = [true],
+    duplicateMarker = false, crop, rotation = 0, userUnit = 1, maskUsesMarker = false } = options;
+  const [left, bottom, right, top] = media;
+  const width = right-left;
+  const height = top-bottom;
+  const transform = footer || [80, 0, 0, 30, right-95, bottom+10];
+  const box = [transform[4], transform[5], transform[4]+transform[0], transform[5]+transform[3]];
+  const doc = await PDFDocument.create({ updateMetadata: false });
+  const context = doc.context;
+  const pixelDimensions = encoding === 'DCTDecode' ? [3, 1] : pixels;
+  const data = encoding === 'DCTDecode' ? tinyJpeg
+    : Uint8Array.from({ length: pixelDimensions[0]*pixelDimensions[1]*3 }, (_, index) => (index*19+37)%251);
+  const dict = { Type: 'XObject', Subtype: 'Image', Width: pixelDimensions[0], Height: pixelDimensions[1],
+    ColorSpace: 'DeviceRGB', BitsPerComponent: 8 };
+  const marker = encoding === 'FlateDecode' ? context.flateStream(data, dict)
+    : context.stream(data, encoding ? { ...dict, Filter: encoding } : dict);
+  const markerRef = context.register(marker);
+  let bodyObject = context.flateStream(new Uint8Array([235, 237, 240, 230, 232, 235, 225, 227, 230, 220, 222, 225]), {
+    Type: 'XObject', Subtype: 'Image', Width: 2, Height: 2, ColorSpace: 'DeviceRGB', BitsPerComponent: 8,
+  });
+  if (maskUsesMarker) bodyObject.dict.set(N('SMask'), markerRef);
+  if (bodyForm) bodyObject = context.flateStream(Buffer.from('1 1 1 rg 0 0 1 1 re f'), {
+    Type: 'XObject', Subtype: 'Form', BBox: [0, 0, 1, 1], Resources: {},
+  });
+  const bodyRef = context.register(bodyObject);
+  const resourceMap = { [resourceName]: markerRef, Body: bodyRef };
+  if (extraForm) resourceMap.UnrelatedForm = context.register(context.flateStream(Buffer.from('q Q'), {
+    Type: 'XObject', Subtype: 'Form', BBox: [0, 0, 1, 1], Resources: {},
+  }));
+  const resources = context.register(context.obj({ XObject: resourceMap }));
+  const main = bodyTransform || [width-10, 0, 0, height-62, left+5, bottom+52];
+  const bodyCall = body ? `q ${main.join(' ')} cm /Body Do Q\n` : '';
+  const footerCall = `q ${transform.join(' ')} cm /${resourceName} Do Q`;
+  const formCall = extraForm ? 'q 10 0 0 10 100 100 cm /UnrelatedForm Do Q\n' : '';
+  const text = `${prefix}${bodyCall}${formCall}${footerCall}${duplicateMarker ? `\n${footerCall}` : ''}`;
+  const sharedContents = context.register(context.flateStream(Buffer.from(text, 'latin1')));
+  for (const hasLink of linksByPage) {
+    const page = doc.addPage([width, height]);
+    page.node.set(N('MediaBox'), context.obj(media));
+    page.node.set(N('Resources'), resources);
+    page.node.set(N('Contents'), sharedContents);
+    if (crop) page.node.set(N('CropBox'), context.obj(crop));
+    if (rotation) page.node.set(N('Rotate'), context.obj(rotation));
+    if (userUnit !== 1) page.node.set(N('UserUnit'), context.obj(userUnit));
+    const specs = hasLink ? annotationSpecs || [{ uri: 'https://v3.camscanner.com/user/download' }] : [];
+    if (specs.length) {
+      page.node.set(N('Annots'), context.obj(specs.map((spec) => {
+        const annotation = context.obj({ Type: 'Annot', Subtype: spec.subtype || 'Link', Rect: spec.rect || box,
+          A: { S: spec.actionType || 'URI', URI: PDFString.of(spec.uri || 'https://v3.camscanner.com/user/download') } });
+        if (spec.appearance) annotation.set(N('AP'), context.obj({ N: context.register(context.flateStream(
+          Buffer.from(spec.appearance === 'empty' ? 'q Q' : '1 0 0 rg 0 0 80 30 re f'),
+          { Type: 'XObject', Subtype: 'Form', BBox: [0, 0, 80, 30], Resources: {} })) }));
+        if (spec.additionalAction) annotation.set(N('AA'), context.obj({ E: { S: 'URI', URI: PDFString.of('https://other.example') } }));
+        if (spec.chain) annotation.lookup(N('A'), PDFDict).set(N('Next'), context.obj({ S: 'URI', URI: PDFString.of('https://other.example') }));
+        return context.register(annotation);
+      })));
+    }
+  }
+  return { bytes: await doc.save({ useObjectStreams: false, updateFieldAppearances: false }), markerBytes: marker.contents };
+}
+
+async function verifyStructuralFixture(options, expected = 'cleaned') {
+  const test = await structuralFixture(options);
+  const result = await cleanPdf(test.bytes);
+  assert.equal(result.status, expected);
+  if (expected === 'cleaned') {
+    assert.deepEqual(result.methods, ['camscanner-link']);
+    const before = await PDFDocument.load(test.bytes, { updateMetadata: false });
+    const after = await PDFDocument.load(result.bytes, { updateMetadata: false });
+    assert.equal(after.getPageCount(), before.getPageCount());
+    for (const [index, page] of before.getPages().entries()) {
+      const cleaned = after.getPage(index);
+      assert.deepEqual(cleaned.getMediaBox(), page.getMediaBox());
+      assert.deepEqual(cleaned.getCropBox(), page.getCropBox());
+      const body = page.node.Resources().lookup(N('XObject'), PDFDict).lookup(N('Body'), PDFRawStream);
+      const outputBody = cleaned.node.Resources().lookup(N('XObject'), PDFDict).lookup(N('Body'), PDFRawStream);
+      assert.deepEqual(outputBody.contents, body.contents);
+    }
+    if (!options?.linksByPage?.includes(false)) assert.equal(Buffer.from(result.bytes).includes(Buffer.from(test.markerBytes)), false);
+  } else assert.equal(result.bytes, undefined);
+  return result;
+}
+
 await assert.rejects(cleanPdf(new Uint8Array()), (error) => error.code === 'invalid');
 await assert.rejects(cleanPdf(new TextEncoder().encode('This is not a PDF.')), (error) => error.code === 'invalid');
 passed('invalid files rejected');
@@ -91,6 +181,76 @@ encrypted.context.trailerInfo.Encrypt = encrypted.context.register(encrypted.con
 }));
 await assert.rejects(cleanPdf(await encrypted.save()), (error) => error.code === 'encrypted');
 passed('encrypted PDF trailer rejected');
+
+for (const options of [
+  { encoding: 'DCTDecode', resourceName: 'OtherVersion' },
+  { encoding: 'FlateDecode', pixels: [240, 90] },
+  { encoding: 'FlateDecode', pixels: [480, 180], resourceName: 'ChangedSize' },
+  { encoding: null, pixels: [48, 18], resourceName: 'Uncompressed' },
+  { encoding: 'FlateDecode', media: [0, 0, 842, 595] },
+  { encoding: 'FlateDecode', media: [20, 30, 615, 872] },
+  { encoding: 'FlateDecode', bodyForm: true, extraForm: true },
+  { annotationSpecs: [{ appearance: 'empty' }] },
+]) await verifyStructuralFixture(options);
+passed('structural detection supports changed pixel dimensions, resource names, DCT/Flate/raw images, landscape and nonzero origins');
+
+for (const uri of [
+  'https://camscanner.com.evil.example/user/download',
+  'https://evilcamscanner.com/user/download',
+  'https://camscanner.com@evil.example/user/download',
+  'https://v3.camscanner.com/share/show',
+  'https://v3.camscanner.com/document/download-copy',
+  'https://other.example/user/download',
+  'javascript:alert(1)',
+]) await verifyStructuralFixture({ annotationSpecs: [{ uri }] }, 'skipped');
+passed('spoofed domains, non-promotion paths, and non-HTTP actions cannot establish watermark identity');
+
+for (const options of [
+  { linksByPage: [false] },
+  { body: false },
+  { annotationSpecs: [{ rect: [501.5, 10, 581.5, 40] }] },
+  { annotationSpecs: [{ subtype: 'Text' }] },
+  { annotationSpecs: [{ actionType: 'GoTo' }] },
+  { annotationSpecs: [{ appearance: 'painted' }] },
+  { annotationSpecs: [{ additionalAction: true }] },
+  { annotationSpecs: [{ chain: true }] },
+]) await verifyStructuralFixture(options, 'skipped');
+passed('anonymous footers, missing body evidence, mismatched rectangles, and links with visible appearances or extra actions are preserved');
+
+for (const options of [
+  { footer: [595, 0, 0, 842, 0, 0] },
+  { footer: [160, 0, 0, 30, 420, 10] },
+  { footer: [80, 0, 0, 60, 500, 10] },
+  { footer: [30, 0, 0, 30, 550, 10] },
+  { footer: [80, 0, 0, 30, 10, 10] },
+  { bodyTransform: [595, 0, 0, 842, 0, 0] },
+  { duplicateMarker: true },
+  { maskUsesMarker: true },
+]) await verifyStructuralFixture(options, 'skipped');
+passed('linked body images, abnormal physical dimensions, overlapping content, duplicate calls, and masks cannot be mistaken for a footer');
+
+for (const options of [
+  { prefix: 'BT (Text) Tj ET\n' },
+  { prefix: '0 0 20 20 re f\n' },
+  { prefix: '0 0 595 842 re W n\n' },
+  { crop: [0, 0, 590, 840] },
+  { rotation: 90 },
+  { userUnit: 2 },
+  { footer: [80, 2, 0, 30, 500, 10], annotationSpecs: [{ rect: [500, 10, 580, 42] }] },
+  { footer: [-80, 0, 0, 30, 580, 10], annotationSpecs: [{ rect: [500, 10, 580, 40] }] },
+]) await verifyStructuralFixture(options, 'skipped');
+passed('structural mode preserves text/paint/clip pages and ambiguous crop, rotation, scaling, or skew');
+
+const sharedStructural = await verifyStructuralFixture({ linksByPage: [true, false] });
+assert.equal(sharedStructural.changedPages, 1);
+assert.equal(sharedStructural.pages[1].status, 'skipped');
+const sharedStructuralSource = await structuralFixture({ linksByPage: [true, false] });
+const sharedStructuralResult = await cleanPdf(sharedStructuralSource.bytes);
+const sharedBefore = await PDFDocument.load(sharedStructuralSource.bytes);
+const sharedAfter = await PDFDocument.load(sharedStructuralResult.bytes);
+assert.equal(contents(sharedBefore.getPage(1), sharedBefore.context), contents(sharedAfter.getPage(1), sharedAfter.context));
+assert.equal(images(sharedAfter.getPage(1), sharedAfter.context).length, 2);
+passed('cross-page shared resources and shared Contents remain intact on pages without matching links');
 
 if (process.env.SAMPLE_PDF_PATH) {
   let source;
@@ -192,10 +352,50 @@ if (process.env.SAMPLE_PDF_PATH) {
   passed('link cleanup requires matching region, Link subtype, and exact CamScanner domain');
 
   const forms = await cleanPdf(await fixture({ logo, nestedForm: true }));
-  assert.equal(forms.status, 'skipped');
-  passed('nested Form XObject pages are conservatively skipped');
+  assert.equal(forms.status, 'cleaned');
+  passed('unused unrelated Form XObjects do not block a verified footer');
 } else {
   console.log('INFO external sample checks skipped; set SAMPLE_PDF_PATH to a local PDF to include them.');
+}
+
+if (process.env.EXTRA_SAMPLE_PDF_PATH) {
+  let source;
+  try { source = new Uint8Array(await readFile(process.env.EXTRA_SAMPLE_PDF_PATH)); }
+  catch { throw new Error('Could not read the extra external sample PDF.'); }
+  const sourceHash = await digest(source);
+  const before = await PDFDocument.load(source, { updateMetadata: false });
+  const result = await cleanPdf(source);
+  assert.equal(result.status, 'cleaned');
+  assert.equal(result.changedPages, before.getPageCount());
+  assert.equal(result.removedWatermarks, before.getPageCount());
+  assert.equal(result.removedLinks, before.getPageCount());
+  assert.deepEqual(result.methods, ['camscanner-link']);
+  assert.equal(await digest(source), sourceHash);
+  const after = await PDFDocument.load(result.bytes, { updateMetadata: false });
+  const removedStreams = new Map();
+  assert.equal(after.getPageCount(), before.getPageCount());
+  for (const [index, original] of before.getPages().entries()) {
+    const cleaned = after.getPage(index);
+    assert.deepEqual(cleaned.getMediaBox(), original.getMediaBox());
+    assert.deepEqual(cleaned.getCropBox(), original.getCropBox());
+    assert.deepEqual(cleaned.getRotation(), original.getRotation());
+    const inputImages = new Map(images(original, before.context));
+    const outputImages = new Map(images(cleaned, after.context));
+    for (const [key, object] of outputImages) {
+      assert.ok(inputImages.has(key));
+      assert.deepEqual(object.contents, inputImages.get(key).contents);
+      assert.equal(object.dict.get(N('Width')).toString(), inputImages.get(key).dict.get(N('Width')).toString());
+      assert.equal(object.dict.get(N('Height')).toString(), inputImages.get(key).dict.get(N('Height')).toString());
+    }
+    const removed = [...inputImages].filter(([key]) => !outputImages.has(key));
+    assert.equal(removed.length, 1);
+    for (const [, object] of removed) removedStreams.set(await digest(object.contents), object.contents);
+    assert.equal(cleaned.node.Annots()?.size() || 0, 0);
+  }
+  for (const data of removedStreams.values()) assert.equal(Buffer.from(result.bytes).includes(Buffer.from(data)), false);
+  assert.equal((await cleanPdf(result.bytes)).status, 'skipped');
+  if (process.env.EXTRA_CLEANED_PDF_OUTPUT) await writeFile(process.env.EXTRA_CLEANED_PDF_OUTPUT, result.bytes);
+  passed(`extra external sample: ${before.getPageCount()} pages structurally cleaned; body bytes and geometry identical; logo streams absent`);
 }
 
 console.log(`Verified ${checks} checks. No document content was printed.`);

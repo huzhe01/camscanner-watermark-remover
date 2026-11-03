@@ -117,8 +117,10 @@ function concat(left, right) {
   return [a*A+c*B, b*A+d*B, a*C+c*D, b*C+d*D, a*E+c*F+e, b*E+d*F+f];
 }
 
-function bounds([a, b, c, d, e, f]) {
-  const points = [[e, f], [a+e, b+f], [c+e, d+f], [a+c+e, b+d+f]];
+function bounds([a, b, c, d, e, f], rectangle = [0, 0, 1, 1]) {
+  const [x0, y0, x1, y1] = rectangle;
+  const points = [[x0, y0], [x1, y0], [x0, y1], [x1, y1]]
+    .map(([x, y]) => [a*x+c*y+e, b*x+d*y+f]);
   return [Math.min(...points.map((p) => p[0])), Math.min(...points.map((p) => p[1])),
     Math.max(...points.map((p) => p[0])), Math.max(...points.map((p) => p[1]))];
 }
@@ -126,8 +128,77 @@ function bounds([a, b, c, d, e, f]) {
 function isFooter(box, media) {
   const [left, bottom, right, top] = media;
   const [x0, y0, x1, y1] = box;
-  return box.every(Number.isFinite) && x0 >= left+(right-left)*0.5 && x1 <= right+1
-    && y0 >= bottom-1 && y1 <= bottom+(top-bottom)*0.15 && x1 > x0 && y1 > y0;
+  const pageWidth = right-left;
+  const pageHeight = top-bottom;
+  const width = x1-x0;
+  const height = y1-y0;
+  return box.every(Number.isFinite) && pageWidth > 0 && pageHeight > 0
+    && width >= 16 && width <= Math.min(180, pageWidth*0.25)
+    && height >= 5 && height <= Math.min(54, pageHeight*0.10)
+    && width/height >= 1.5 && width/height <= 12
+    && x0 >= left+pageWidth*0.5 && x1 <= right+0.75
+    && right-x1 <= Math.max(24, pageWidth*0.08)
+    && y0 >= bottom-0.75 && y0 <= bottom+36
+    && y1 <= bottom+Math.min(72, pageHeight*0.12);
+}
+
+const sameRectangle = (a, b) => a && b && a.every((value, index) => Math.abs(value-b[index]) <= 0.75);
+const intersects = (a, b, gap = 2) => a[0] < b[2]+gap && a[2] > b[0]-gap
+  && a[1] < b[3]+gap && a[3] > b[1]-gap;
+
+function isCamScannerDownload(text) {
+  try {
+    const url = new URL(text);
+    const hostname = url.hostname.toLowerCase();
+    return ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password
+      && (hostname === 'camscanner.com' || hostname.endsWith('.camscanner.com'))
+      && /^\/(?:user\/)?download(?:\.html)?\/?$/i.test(url.pathname);
+  } catch { return false; }
+}
+
+function hasOnlyEmptyAppearances(annotation, context) {
+  if (!annotation.has(name('AP'))) return true;
+  const seen = new Set();
+  const empty = (value, depth = 0) => {
+    const object = context.lookup(value);
+    if (!object || seen.has(object) || depth > 12) return false;
+    seen.add(object);
+    if (object instanceof PDFRawStream) {
+      try {
+        const tokens = tokenize(decodePDFRawStream(object).decode());
+        let balance = 0;
+        for (const token of tokens) {
+          if (token.kind !== 'operator' || !['q', 'Q'].includes(token.value)) return false;
+          balance += token.value === 'q' ? 1 : -1;
+          if (balance < 0) return false;
+        }
+        return balance === 0;
+      } catch { return false; }
+    }
+    return object instanceof PDFDict && object.values().every((child) => empty(child, depth+1));
+  };
+  return empty(annotation.get(name('AP')));
+}
+
+function sourceLinks(page, context) {
+  const result = [];
+  let annotations;
+  try { annotations = page.node.Annots(); } catch { return result; }
+  if (!annotations) return result;
+  for (const reference of annotations.asArray()) {
+    try {
+      const annotation = context.lookup(reference);
+      if (!(annotation instanceof PDFDict) || annotation.get(name('Subtype')) !== name('Link')) continue;
+      const action = annotation.lookupMaybe(name('A'), PDFDict);
+      if (action?.get(name('S')) !== name('URI')) continue;
+      if (!hasOnlyEmptyAppearances(annotation, context) || annotation.has(name('AA')) || action.has(name('Next'))) continue;
+      const uri = action.lookup(name('URI'));
+      if (!(uri instanceof PDFString || uri instanceof PDFHexString) || !isCamScannerDownload(uri.decodeText())) continue;
+      const rectangle = numericArray(annotation.lookupMaybe(name('Rect'), PDFArray), 4);
+      if (rectangle && rectangle[2] > rectangle[0] && rectangle[3] > rectangle[1]) result.push({ reference, rectangle });
+    } catch { /* An unfamiliar annotation cannot establish watermark identity. */ }
+  }
+  return result;
 }
 
 async function sha256(bytes) {
@@ -164,12 +235,10 @@ function decodeContents(page, context) {
   return joined;
 }
 
-function planRemovals(bytes, candidates, media) {
+function inspectContent(bytes, objects, context) {
   const tokens = tokenize(bytes);
-  const ranges = [];
-  const regions = [];
-  const removedNames = new Set();
-  const retainedNames = new Set();
+  const calls = [];
+  let simpleScanOperations = true;
   let operands = [];
   let matrix = IDENTITY;
   const stack = [];
@@ -178,6 +247,7 @@ function planRemovals(bytes, candidates, media) {
     if (['BI', 'ID', 'EI'].includes(token.value)) {
       throw new UnsupportedPageError('页面含内嵌图片，暂不自动修改，已跳过。');
     }
+    if (!['q', 'Q', 'cm', 'Do', 'ri'].includes(token.value)) simpleScanOperations = false;
     if (token.value === 'q' || token.value === 'Q') {
       if (operands.length) throw new UnsupportedPageError('页面图形状态格式异常，已跳过。');
       if (token.value === 'q') stack.push(matrix);
@@ -195,18 +265,106 @@ function planRemovals(bytes, candidates, media) {
         throw new UnsupportedPageError('页面图片调用无法安全识别，已跳过。');
       }
       const objectName = operands[0].value;
-      const box = bounds(matrix);
-      if (candidates.has(objectName) && isFooter(box, media)) {
-        ranges.push([operands[0].start, token.end]);
-        regions.push(box);
-        removedNames.add(objectName);
-      } else retainedNames.add(objectName);
+      const object = context.lookup(objects.get(name(objectName)));
+      if (!(object instanceof PDFStream)) throw new UnsupportedPageError('页面图像资源无法识别，已跳过。');
+      const subtype = object.dict.get(name('Subtype'));
+      let box;
+      let independentResources = true;
+      if (subtype === name('Image')) {
+        box = bounds(matrix);
+      } else if (subtype === name('Form')) {
+        const rectangle = numericArray(object.dict.lookupMaybe(name('BBox'), PDFArray), 4);
+        const transformObject = object.dict.lookupMaybe(name('Matrix'), PDFArray);
+        const transform = transformObject ? numericArray(transformObject, 6) : IDENTITY;
+        if (!rectangle || !transform) throw new UnsupportedPageError('嵌套图形的占用范围无法确定，已跳过。');
+        box = bounds(concat(matrix, transform), rectangle);
+        independentResources = object.dict.lookupMaybe(name('Resources'), PDFDict) !== undefined;
+      } else {
+        throw new UnsupportedPageError('页面含未知的可绘制资源，已跳过。');
+      }
+      calls.push({ objectName, object, subtype, box, independentResources, matrix,
+        range: [operands[0].start, token.end] });
+    } else if (token.value === 'ri' && (operands.length !== 1 || operands[0].kind !== 'name')) {
+      throw new UnsupportedPageError('页面渲染参数格式异常，已跳过。');
     }
     operands = [];
   }
   if (stack.length || operands.length) throw new UnsupportedPageError('页面内容未完整闭合，已跳过。');
-  for (const retained of retainedNames) removedNames.delete(retained);
-  return { ranges, regions, unusedNames: removedNames };
+  return { calls, simpleScanOperations };
+}
+
+function objectGraphContains(root, target, context) {
+  const pending = [root];
+  const seen = new Set();
+  while (pending.length) {
+    const object = context.lookup(pending.pop());
+    if (object === target) return true;
+    if (!object || seen.has(object)) continue;
+    seen.add(object);
+    if (object instanceof PDFDict) pending.push(...object.values());
+    else if (object instanceof PDFArray) pending.push(...object.asArray());
+    else if (object instanceof PDFStream) pending.push(object.dict);
+  }
+  return false;
+}
+
+async function planRemovals(content, media, links, hashes, context, standardPageCoordinates) {
+  const { calls, simpleScanOperations } = content;
+  const chosen = [];
+  const rejectedReasons = [];
+  const forms = calls.filter((call) => call.subtype === name('Form'));
+  for (const call of calls) {
+    if (call.subtype !== name('Image') || !(call.object instanceof PDFRawStream) || !isFooter(call.box, media)) continue;
+    if (!hashes.has(call.object)) hashes.set(call.object, await sha256(call.object.contents));
+    const signature = KNOWN_LOGO_HASHES.has(hashes.get(call.object));
+    const linked = links.some((link) => sameRectangle(call.box, link.rectangle));
+    if (!signature && !linked) {
+      rejectedReasons.push('页脚图片缺少同位置的扫描全能王下载链接，且未命中已知标记。');
+      continue;
+    }
+    if (calls.some((other) => other !== call && intersects(call.box, other.box))) {
+      rejectedReasons.push('页脚图片与其他正文图形区域重叠或间距不足，已保留原页。');
+      continue;
+    }
+    if (forms.some((form) => !form.independentResources || objectGraphContains(form.object, call.object, context))) {
+      rejectedReasons.push('嵌套图形与页脚可能共享图片资源，无法安全分离，已保留原页。');
+      continue;
+    }
+    if (calls.some((other) => other.object !== call.object
+      && objectGraphContains(other.object, call.object, context))) {
+      rejectedReasons.push('页脚图片仍被正文图形作为蒙版或资源引用，已保留原页。');
+      continue;
+    }
+    if (!signature) {
+      if (!standardPageCoordinates || call.matrix[0] <= 0 || call.matrix[3] <= 0
+        || Math.abs(call.matrix[1]) > 1e-6 || Math.abs(call.matrix[2]) > 1e-6) {
+        rejectedReasons.push('页面或页脚图片采用旋转、倾斜或特殊裁剪边界，结构识别暂不自动处理。');
+        continue;
+      }
+      if (!simpleScanOperations) {
+        rejectedReasons.push('页面含文字、绘制或裁剪操作，无法确认页脚图片与正文分离。');
+        continue;
+      }
+      const pageArea = (media[2]-media[0])*(media[3]-media[1]);
+      const hasSeparateBody = calls.some((other) => other !== call
+        && other.box[1] >= call.box[3]+2
+        && other.box[2]-other.box[0] >= (media[2]-media[0])*0.5
+        && other.box[3]-other.box[1] >= (media[3]-media[1])*0.35
+        && (other.box[2]-other.box[0])*(other.box[3]-other.box[1]) >= pageArea*0.20);
+      if (!hasSeparateBody) {
+        rejectedReasons.push('未找到与页脚分离的主要正文图像，已保留原页。');
+        continue;
+      }
+    }
+    chosen.push({ ...call, method: signature ? 'known-signature' : 'camscanner-link' });
+  }
+  const unusedNames = new Set(chosen.map((call) => call.objectName));
+  const selectedRanges = new Set(chosen.map((call) => call.range));
+  for (const call of calls) if (!selectedRanges.has(call.range)) unusedNames.delete(call.objectName);
+  return { ranges: chosen.map((call) => call.range), regions: chosen.map((call) => call.box),
+    methods: [...new Set(chosen.map((call) => call.method))],
+    detections: chosen.map((call) => ({ region: call.box, method: call.method })), unusedNames,
+    reason: rejectedReasons[0] || '未发现符合大小与位置要求的独立右下页脚图片。' };
 }
 
 function removeRanges(bytes, ranges) {
@@ -225,26 +383,16 @@ function removeRanges(bytes, ranges) {
 }
 
 function removeFooterLinks(page, context, regions) {
-  const annotations = page.node.Annots();
+  let annotations;
+  try { annotations = page.node.Annots(); } catch { return 0; }
   if (!annotations) return 0;
+  const matched = new Set(sourceLinks(page, context)
+    .filter((link) => regions.some((box) => sameRectangle(box, link.rectangle)))
+    .map((link) => link.reference));
   const retained = [];
   let count = 0;
   for (const reference of annotations.asArray()) {
-    let remove = false;
-    try {
-      const annotation = context.lookup(reference);
-      if (annotation instanceof PDFDict && annotation.get(name('Subtype')) === name('Link')) {
-        const rect = numericArray(annotation.lookupMaybe(name('Rect'), PDFArray), 4);
-        const action = annotation.lookupMaybe(name('A'), PDFDict);
-        const uri = action?.lookup(name('URI'));
-        const text = uri instanceof PDFString || uri instanceof PDFHexString ? uri.decodeText() : '';
-        let hostname = '';
-        try { hostname = new URL(text).hostname.toLowerCase(); } catch { /* Keep unknown links. */ }
-        remove = Boolean(rect && regions.some((box) => box.every((v, i) => Math.abs(v-rect[i]) <= 2))
-          && (hostname === 'camscanner.com' || hostname.endsWith('.camscanner.com')));
-      }
-    } catch { /* Keep malformed or unfamiliar annotations. */ }
-    if (remove) count += 1;
+    if (matched.has(reference)) count += 1;
     else retained.push(reference);
   }
   if (count) {
@@ -331,8 +479,10 @@ function removeUnreachableObjects(context) {
 }
 
 /**
- * Clean a PDF locally. Only the verified independent CamScanner footer image
- * is eligible. Unknown images and unsupported page structures are preserved.
+ * Clean a PDF locally. Identify independent footer images either by a verified
+ * signature or by a matching CamScanner download link, small physical bounds,
+ * simple scan drawing operations, and clear separation from the body image.
+ * Unknown or ambiguous structures are preserved rather than painted over.
  * `pages[].index` is zero-based; `pages[].pageNumber` is one-based.
  */
 export async function cleanPdf(input) {
@@ -355,33 +505,25 @@ export async function cleanPdf(input) {
   let removedWatermarks = 0;
   let removedLinks = 0;
   for (const [index, page] of document.getPages().entries()) {
-    const result = { index, pageNumber: index+1, status: 'skipped', removedWatermarks: 0, removedLinks: 0, regions: [] };
+    const result = { index, pageNumber: index+1, status: 'skipped', removedWatermarks: 0,
+      removedLinks: 0, regions: [], methods: [] };
     pageResults.push(result);
     const originalEntries = ['Resources', 'Contents', 'Annots'].map((key) => [name(key), page.node.get(name(key))]);
     try {
       const resources = page.node.Resources();
       const objects = resources?.lookupMaybe(name('XObject'), PDFDict);
-      if (!objects) { result.reason = '未发现已知的独立水印。'; continue; }
-      const candidates = new Set();
-      let hasForms = false;
-      for (const [key, reference] of objects.entries()) {
-        const object = context.lookup(reference);
-        if (!(object instanceof PDFStream)) continue;
-        if (object.dict.get(name('Subtype')) === name('Form')) hasForms = true;
-        if (!(object instanceof PDFRawStream) || object.dict.get(name('Subtype')) !== name('Image')) continue;
-        const width = object.dict.lookupMaybe(name('Width'), PDFNumber)?.asNumber();
-        const height = object.dict.lookupMaybe(name('Height'), PDFNumber)?.asNumber();
-        if (width !== 312 || height !== 90 || object.dict.lookup(name('Filter')) !== name('DCTDecode')) continue;
-        if (!hashes.has(object)) hashes.set(object, await sha256(object.contents));
-        if (KNOWN_LOGO_HASHES.has(hashes.get(object))) candidates.add(key.decodeText());
-      }
-      if (!candidates.size) { result.reason = '未发现已知的独立水印；不自动涂白页面。'; continue; }
-      if (hasForms) { result.reason = '页面包含嵌套图形对象，暂不自动修改。'; continue; }
+      if (!objects) { result.reason = '未发现独立图片资源；水印可能已融入整页扫描图。'; continue; }
       const media = numericArray(page.node.MediaBox(), 4);
       if (!media) throw new UnsupportedPageError('页面尺寸无法识别，已跳过。');
       const content = decodeContents(page, context);
-      const plan = planRemovals(content, candidates, media);
-      if (!plan.ranges.length) { result.reason = '已知标记不在可安全处理的右下页脚区域。'; continue; }
+      const crop = numericArray(page.node.CropBox() || page.node.MediaBox(), 4);
+      const angle = page.getRotation().angle;
+      const unit = context.lookup(page.node.get(name('UserUnit')));
+      const standardPageCoordinates = sameRectangle(media, crop) && ((angle % 360)+360)%360 === 0
+        && (unit === undefined || (unit instanceof PDFNumber && unit.asNumber() === 1));
+      const parsed = inspectContent(content, objects, context);
+      const plan = await planRemovals(parsed, media, sourceLinks(page, context), hashes, context, standardPageCoordinates);
+      if (!plan.ranges.length) { result.reason = plan.reason; continue; }
       const resourceCopy = resources.clone(context);
       const objectCopy = objects.clone(context);
       for (const unused of plan.unusedNames) objectCopy.delete(name(unused));
@@ -392,6 +534,9 @@ export async function cleanPdf(input) {
       result.status = 'cleaned';
       result.removedWatermarks = plan.ranges.length;
       result.regions = plan.regions;
+      result.methods = plan.methods;
+      result.method = plan.methods.length === 1 ? plan.methods[0] : 'mixed';
+      result.detections = plan.detections;
       removedWatermarks += result.removedWatermarks;
       removedLinks += result.removedLinks;
     } catch (error) {
@@ -404,8 +549,9 @@ export async function cleanPdf(input) {
     }
   }
   const base = { pageCount: document.getPageCount(), changedPages: pageResults.filter((p) => p.status === 'cleaned').length,
-    removedWatermarks, removedLinks, pages: pageResults };
-  if (!removedWatermarks) return { ...base, status: 'skipped', reason: '未找到可安全移除的已知扫描全能王页脚水印。' };
+    removedWatermarks, removedLinks, pages: pageResults,
+    methods: [...new Set(pageResults.flatMap((page) => page.methods))] };
+  if (!removedWatermarks) return { ...base, status: 'skipped', reason: '未找到同时满足标记依据、页脚位置和正文分离条件的独立水印。' };
   removeShadowedPageTreeResources(context);
   removeUnreachableObjects(context);
   const bytes = await document.save({ useObjectStreams: false, addDefaultPage: false, updateFieldAppearances: false });

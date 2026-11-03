@@ -27,6 +27,8 @@ jobs:
           cache: npm
       - name: Install locked dependencies
         run: npm ci
+      - name: Verify synthetic PDF fixtures
+        run: npm test
       - name: Build static site
         run: npm run build
       - name: Upload Pages artifact
